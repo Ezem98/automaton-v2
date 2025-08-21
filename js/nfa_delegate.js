@@ -7,6 +7,104 @@ var nfa_delegate = (function() {
   var emptyLabel = 'ϵ';
   
   var statusConnectors = [];
+
+  // ---------- Utils: parsing & compaction ----------
+  function isDigit(ch) { return ch >= '0' && ch <= '9'; }
+  function isUpper(ch) { return ch >= 'A' && ch <= 'Z'; }
+  function isLower(ch) { return ch >= 'a' && ch <= 'z'; }
+
+  function sameClass(a, b) {
+    return (isDigit(a) && isDigit(b)) ||
+           (isUpper(a) && isUpper(b)) ||
+           (isLower(a) && isLower(b));
+  }
+
+  // Expande especificaciones como:
+  // "A-Z, a-z, 0-9", "abc", "0-3,7", "[a-c]", "x, y, z"
+  function expandSpecToChars(spec) {
+    if (!spec) return [];
+    var s = ('' + spec).trim();
+    if (!s) return [];
+
+    // Quitar corchetes opcionales tipo [a-z]
+    if (/^\[.*\]$/.test(s)) s = s.slice(1, -1);
+
+    // Separar por comas o espacios
+    var tokens = s.split(/[\s,]+/).filter(Boolean);
+    var out = [];
+
+    tokens.forEach(function (tok) {
+      // Rango simple X-Y (letras o dígitos)
+      var m = /^([A-Za-z0-9])-([A-Za-z0-9])$/.exec(tok);
+      if (m) {
+        var a = m[1].charCodeAt(0), b = m[2].charCodeAt(0);
+        if (a > b) { var t = a; a = b; b = t; }
+        for (var c = a; c <= b; c++) out.push(String.fromCharCode(c));
+        return;
+      }
+      // Cadena larga "abc" => a, b, c
+      if (/^[A-Za-z0-9_]+$/.test(tok) && tok.length > 1) {
+        for (var i = 0; i < tok.length; i++) out.push(tok[i]);
+        return;
+      }
+      // Un solo carácter visible (permitimos guion bajo también)
+      if (tok.length === 1) {
+        out.push(tok);
+        return;
+      }
+      // Si llega algo raro, lo ignoramos silenciosamente.
+    });
+
+    // De-dup
+    var seen = Object.create(null);
+    var arr = [];
+    out.forEach(function (ch) {
+      if (!seen[ch]) { seen[ch] = true; arr.push(ch); }
+    });
+    return arr;
+  }
+
+  function tokenForRange(a, b) {
+    return (a === b) ? a : (a + '-' + b);
+  }
+
+  // Compacta una lista de chars a "A-Z, a, b, 0-9" agrupando por clase y contiguidad
+  function compactChars(chars) {
+    if (!chars || !chars.length) return '';
+    var list = chars.slice().sort(function (x, y) {
+      return x.charCodeAt(0) - y.charCodeAt(0);
+    });
+
+    var res = [];
+    var start = list[0];
+    var prev = list[0];
+
+    for (var i = 1; i < list.length; i++) {
+      var ch = list[i];
+      if (sameClass(prev, ch) && ch.charCodeAt(0) === prev.charCodeAt(0) + 1) {
+        prev = ch; // seguimos rango
+      } else {
+        res.push(tokenForRange(start, prev));
+        start = prev = ch;
+      }
+    }
+    res.push(tokenForRange(start, prev));
+
+    return res.join(', ');
+  }
+
+  // Retorna todos los símbolos que en el modelo van de source->target (según NFA actual)
+  function getCharsForConnection(sourceId, targetId) {
+    var model = nfa.serialize();
+    var bySource = model.transitions[sourceId] || {};
+    var acc = [];
+    $.each(bySource, function (ch, destinations) {
+      if (destinations.indexOf && destinations.indexOf(targetId) !== -1) {
+        acc.push(ch);
+      }
+    });
+    return acc;
+  }
   
   var updateUIForDebug = function() {
     var status = nfa.status();
@@ -30,18 +128,60 @@ var nfa_delegate = (function() {
   };
 
   var dialogSave = function(update) {
-    var inputChar = $('#nfa_dialog_readCharTxt').val();
-    if (inputChar.length > 1) {inputChar = inputChar[0];}
-    
-    if (update) {
-      nfa.removeTransition(dialogActiveConnection.sourceId, dialogActiveConnection.getLabel(), dialogActiveConnection.targetId);
-    } else if (nfa.hasTransition(dialogActiveConnection.sourceId, inputChar, dialogActiveConnection.targetId)) {
-      alert(dialogActiveConnection.sourceId + " already has a transition to " + dialogActiveConnection.targetId + " on " + (inputChar || emptyLabel));
+    var inputSpec = $('#nfa_dialog_readCharTxt').val();
+    inputSpec = inputSpec != null ? ('' + inputSpec).trim() : '';
+
+    var sourceId = dialogActiveConnection.sourceId;
+    var targetId = dialogActiveConnection.targetId;
+
+    // Si está vacío, es epsilon
+    if (!inputSpec) {
+      if (update) {
+        nfa.removeTransition(sourceId, dialogActiveConnection.getLabel(), targetId);
+      } else if (nfa.hasTransition(sourceId, '', targetId)) {
+        alert(sourceId + " already has a transition to " + targetId + " on " + emptyLabel);
+        return;
+      }
+      
+      dialogActiveConnection.setLabel(emptyLabel);
+      nfa.addTransition(sourceId, '', targetId);
+      dialogDiv.dialog("close");
       return;
     }
+
+    // Expandir a caracteres individuales
+    var chars = expandSpecToChars(inputSpec);
+    if (!chars.length) {
+      alert("No hay símbolos válidos en la especificación.");
+      return;
+    }
+
+    // Si estamos editando, eliminar TODAS las transiciones actuales source->target
+    if (update) {
+      var existing = getCharsForConnection(sourceId, targetId);
+      existing.forEach(function (ch) {
+        nfa.removeTransition(sourceId, ch, targetId);
+      });
+    }
+
+    // Verificar conflictos antes de agregar
+    for (var i = 0; i < chars.length; i++) {
+      var ch = chars[i];
+      if (!update && nfa.hasTransition(sourceId, ch, targetId)) {
+        alert(sourceId + " already has a transition to " + targetId + " on " + ch);
+        return;
+      }
+    }
+
+    // Agregar todas las transiciones
+    chars.forEach(function (ch) {
+      nfa.addTransition(sourceId, ch, targetId);
+    });
+
+    // Actualizar etiqueta visual con formato compacto
+    var compactLabel = compactChars(chars);
+    dialogActiveConnection.setLabel(compactLabel);
     
-    dialogActiveConnection.setLabel(inputChar || emptyLabel);
-    nfa.addTransition(dialogActiveConnection.sourceId, inputChar, dialogActiveConnection.targetId);
     dialogDiv.dialog("close");
   };
 
@@ -62,23 +202,35 @@ var nfa_delegate = (function() {
 
   var makeDialog = function() {
     dialogDiv = $('<div></div>', {style:'text-align:center;'});
-    $('<div></div>', {style:'font-size:small;'}).html('Blank for Empty String: '+emptyLabel+'<br />Read from Input').appendTo(dialogDiv);
-    $('<span></span>', {id:'nfa_dialog_stateA', 'class':'tranStart'}).appendTo(dialogDiv);
-    $('<input />', {id:'nfa_dialog_readCharTxt', type:'text', maxlength:1, style:'width:30px;text-align:center;'})
-      .val('A')
-      .keypress(function(event) {
-        if (event.which === $.ui.keyCode.ENTER) {dialogDiv.parent().find('div.ui-dialog-buttonset button').eq(-1).click();}
+    $('<div>', { style: 'font-size:small;' })
+      .html('NFAs aceptan ε (vacío). Usá caracteres sueltos, rangos <code>A-Z</code>, <code>a-z</code>, <code>0-9</code> o listas separadas por coma. Ej: <code>A-Z, a, 0-3</code>')
+      .appendTo(dialogDiv);
+
+    $('<span>', { id: 'nfa_dialog_stateA', 'class': 'tranStart' }).appendTo(dialogDiv);
+
+    $('<input>', {
+      id: 'nfa_dialog_readCharTxt',
+      type: 'text',
+      style: 'width: 260px; text-align:center;'
+    })
+      .attr('placeholder', 'Ej: A-Z, a-z, 0-9, _ (vacío = ε)')
+      .keypress(function (event) {
+        if (event.which === $.ui.keyCode.ENTER) {
+          dialogDiv.parent().find('div.ui-dialog-buttonset button').eq(-1).click();
+        }
       })
       .appendTo(dialogDiv);
-    $('<span></span>', {id:'nfa_dialog_stateB', 'class':'tranEnd'}).appendTo(dialogDiv);
+
+    $('<span>', { id: 'nfa_dialog_stateB', 'class': 'tranEnd' }).appendTo(dialogDiv);
+
     $('body').append(dialogDiv);
     
     dialogDiv.dialog({
       dialogClass: "no-close",
       autoOpen: false,
-      title: 'Set Transition Character',
-      height: 220,
-      width: 350,
+      title: 'Set Transition Characters',
+      height: 240,
+      width: 520,
       modal: true,
       open: function() {dialogDiv.find('input').focus().select();}
     });
