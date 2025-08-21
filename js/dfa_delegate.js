@@ -298,11 +298,36 @@ var dfa_delegate = (function () {
       model.states = {};
       model.transitions = [];
 
+      // First, add all states that exist in the UI (including isolated ones)
+      container.find('div.state').each(function() {
+        var stateId = $(this).attr('id');
+        model.states[stateId] = {};
+      });
+
+      // Group transitions by source->target to preserve compact labels
+      var transitionGroups = {};
       $.each(model.dfa.transitions, function (stateA, transition) {
         model.states[stateA] = {};
         $.each(transition, function (character, stateB) {
           model.states[stateB] = {};
-          model.transitions.push({ stateA: stateA, label: character, stateB: stateB });
+          var key = stateA + '->' + stateB;
+          if (!transitionGroups[key]) {
+            transitionGroups[key] = {
+              stateA: stateA,
+              stateB: stateB,
+              characters: []
+            };
+          }
+          transitionGroups[key].characters.push(character);
+        });
+      });
+
+      // Create transitions with compacted labels
+      $.each(transitionGroups, function (key, group) {
+        model.transitions.push({ 
+          stateA: group.stateA, 
+          label: compactChars(group.characters), 
+          stateB: group.stateB 
         });
       });
 

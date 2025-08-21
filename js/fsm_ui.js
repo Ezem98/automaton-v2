@@ -5,6 +5,8 @@ var fsm = (function () {
 	var stateCounter = 0;
 	var saveLoadDialog = null;
 	var renameDialog = null;
+	var autoSaveInterval = null;
+	var AUTO_SAVE_KEY = '_autosave_current_work';
 
 	var localStorageAvailable = function () {
 		return (typeof Storage !== "undefined" && typeof localStorage !== "undefined");
@@ -15,7 +17,11 @@ var fsm = (function () {
 			$('#storedMachines').empty();
 			var keys = [];
 			for (var i = 0; i < localStorage.length; ++i) {
-				keys.push(localStorage.key(i));
+				var key = localStorage.key(i);
+				// Skip auto-save key from the list
+				if (key !== AUTO_SAVE_KEY) {
+					keys.push(key);
+				}
 			}
 			keys.sort();
 			$.each(keys, function (idx, key) {
@@ -24,6 +30,81 @@ var fsm = (function () {
 					.append('<div class="delete" style="display:none;" title="Delete"><img class="delete" src="images/empty.png" /></div>')
 					.appendTo('#storedMachines');
 			});
+		}
+	};
+
+	var autoSave = function () {
+		if (localStorageAvailable() && delegate && container) {
+			try {
+				// Check if there's actually something to save (more than just the start state)
+				var stateCount = container.find('div.state').length;
+				if (stateCount <= 1) {
+					// Only start state exists, don't auto-save empty automaton
+					return;
+				}
+
+				// Use the same serialization logic as the existing save function
+				var model = delegate.serialize();
+				container.find('div.state').each(function () {
+					var id = $(this).attr('id');
+					if (id !== 'start') {
+						$.extend(model.states[id], $(this).position());
+						$.extend(model.states[id], { displayId: $(this).data('displayid') });
+					}
+				});
+				model.bulkTests = {
+					accept: $('#acceptStrings').val(),
+					reject: $('#rejectStrings').val()
+				};
+				model.timestamp = new Date().getTime();
+				
+				// Only save if there are actual states or transitions
+				if (Object.keys(model.states).length > 0 || model.transitions.length > 0) {
+					localStorage.setItem(AUTO_SAVE_KEY, JSON.stringify(model));
+					// Count actual UI states for accurate reporting
+					var uiStateCount = $('#container div.state').length;
+					console.log('Auto-saved at:', new Date().toLocaleTimeString(), 'States:', uiStateCount, 'Transitions:', model.transitions.length);
+				}
+			} catch (e) {
+				console.error('Auto-save failed:', e);
+			}
+		}
+	};
+
+	var loadAutoSave = function () {
+		if (localStorageAvailable()) {
+			try {
+				var autoSaveData = localStorage.getItem(AUTO_SAVE_KEY);
+				if (autoSaveData) {
+					var model = JSON.parse(autoSaveData);
+					// Check if auto-save is recent (less than 1 day old)
+					var now = new Date().getTime();
+					var maxAge = 24 * 60 * 60 * 1000; // 1 day in milliseconds
+					if (model.timestamp && (now - model.timestamp) < maxAge) {
+						// Use the existing loadSerializedFSM function
+						loadSerializedFSM(model);
+						return true;
+					}
+				}
+			} catch (e) {
+				console.warn('Failed to load auto-save:', e);
+			}
+		}
+		return false;
+	};
+
+	var startAutoSave = function () {
+		if (autoSaveInterval) {
+			clearInterval(autoSaveInterval);
+		}
+		// Auto-save every 10 seconds for more responsive saving
+		autoSaveInterval = setInterval(autoSave, 10000);
+	};
+
+	var stopAutoSave = function () {
+		if (autoSaveInterval) {
+			clearInterval(autoSaveInterval);
+			autoSaveInterval = null;
 		}
 	};
 
@@ -172,48 +253,72 @@ var fsm = (function () {
 	};
 
 	var loadSerializedFSM = function (serializedFSM) {
+		console.log('loadSerializedFSM called with:', serializedFSM);
 		var model = serializedFSM;
 		if (typeof serializedFSM === 'string') {
 			model = JSON.parse(serializedFSM);
 		}
 
-		// Load the delegate && reset everything
-		self.reset();
-		$('button.delegate').each(function () {
-			if ($(this).html() === model.type) {
-				$(this).click();
-			}
-		});
+		console.log('Parsed model:', model);
+		console.log('Model states:', model.states);
+		console.log('Model transitions:', model.transitions);
+
+		// Don't reset here if we're loading from auto-save, as it was already reset
+		if (!model.timestamp) {
+			// Load the delegate && reset everything (only for manual loads)
+			self.reset();
+			$('button.delegate').each(function () {
+				if ($(this).html() === model.type) {
+					$(this).click();
+				}
+			});
+		}
 
 		// Load Bulk Tests
-		$('#acceptStrings').val(model.bulkTests.accept);
-		$('#rejectStrings').val(model.bulkTests.reject);
+		if (model.bulkTests) {
+			$('#acceptStrings').val(model.bulkTests.accept || '');
+			$('#rejectStrings').val(model.bulkTests.reject || '');
+		}
 
 		// Create states
+		console.log('Creating states...');
 		$.each(model.states, function (stateId, data) {
+			console.log('Creating state:', stateId, data);
 			var state = null;
 			if (stateId !== 'start') {
-				state = makeState(stateId, data.displayId)
-					.css('left', data.left + 'px')
-					.css('top', data.top + 'px')
+				state = makeState(stateId, data.displayId || stateId)
+					.css('left', (data.left || 100) + 'px')
+					.css('top', (data.top || 100) + 'px')
 					.appendTo(container);
 				jsPlumb.draggable(state, { containment: "parent" });
 				makeStatePlumbing(state);
 			} else {
 				state = $('#start');
 			}
-			if (data.isAccept) { state.find('input.isAccept').prop('checked', true); }
+			if (data.isAccept) { 
+				state.find('input.isAccept').prop('checked', true); 
+			}
 		});
 
 		// Create Transitions
+		console.log('Creating transitions...');
 		jsPlumb.unbind("jsPlumbConnection"); // unbind listener to prevent transition prompts
 		$.each(model.transitions, function (index, transition) {
-			jsPlumb.connect({ source: transition.stateA, target: transition.stateB }).setLabel(transition.label);
+			console.log('Creating transition:', transition);
+			var connection = jsPlumb.connect({ source: transition.stateA, target: transition.stateB });
+			if (connection) {
+				connection.setLabel(transition.label);
+			}
 		});
 		jsPlumb.bind("jsPlumbConnection", delegate.connectionAdded);
 
 		// Deserialize to the fsm
-		delegate.deserialize(model);
+		console.log('Deserializing to FSM...');
+		if (delegate && delegate.deserialize) {
+			delegate.deserialize(model);
+		}
+		
+		console.log('loadSerializedFSM completed');
 	};
 
 	var updateStatusUI = function (status) {
@@ -263,6 +368,68 @@ var fsm = (function () {
 		initFSMSelectors();
 		makeSaveLoadDialog();
 		makeRenameDialog();
+		
+		// Check for auto-saved work after a longer delay to ensure everything is loaded
+		setTimeout(function() {
+			console.log('Checking for auto-save...');
+			if (localStorageAvailable()) {
+				var autoSaveData = localStorage.getItem(AUTO_SAVE_KEY);
+				console.log('Auto-save data found:', !!autoSaveData);
+				if (autoSaveData) {
+					try {
+						var model = JSON.parse(autoSaveData);
+						var now = new Date().getTime();
+						var maxAge = 24 * 60 * 60 * 1000; // 1 day
+						console.log('Auto-save timestamp:', model.timestamp, 'Age:', (now - model.timestamp) / 1000 / 60, 'minutes');
+						if (model.timestamp && (now - model.timestamp) < maxAge) {
+							// Use setTimeout to ensure the confirm dialog appears after page is fully loaded
+							setTimeout(function() {
+								var userChoice = confirm('Se encontró trabajo guardado automáticamente. ¿Deseas restaurarlo?');
+								console.log('User choice:', userChoice);
+								if (userChoice === true) {
+									console.log('Loading auto-saved model...');
+									console.log('Model data:', model);
+									try {
+										// Wait a bit more before loading to ensure UI is ready
+										setTimeout(function() {
+											// Reset first to clear any existing state
+											self.reset();
+											
+											// Load the correct delegate type
+											if (model.type) {
+												$('button.delegate').each(function () {
+													if ($(this).html() === model.type) {
+														$(this).click();
+													}
+												});
+											}
+											
+											// Wait for delegate to be set, then load the model
+											setTimeout(function() {
+												loadSerializedFSM(model);
+												console.log('Auto-save loaded successfully');
+											}, 200);
+										}, 100);
+									} catch (e) {
+										console.error('Error loading auto-save:', e);
+									}
+								} else {
+									console.log('User declined to restore auto-save');
+								}
+							}, 100);
+						} else {
+							console.log('Auto-save too old, ignoring');
+						}
+					} catch (e) {
+						console.error('Failed to load auto-save:', e);
+					}
+				}
+			} else {
+				console.log('localStorage not available');
+			}
+			console.log('Starting auto-save interval...');
+			startAutoSave();
+		}, 1000);
 
 		var exampleBox = $('#examples').on('change', function () {
 			if ($(this).val() !== '') {
@@ -332,6 +499,7 @@ var fsm = (function () {
 			jsPlumb.bind("jsPlumbConnection", delegate.connectionAdded);
 			stateCounter = 0;
 			makeStartState();
+			startAutoSave(); // Restart auto-save when delegate changes
 			return self;
 		},
 
@@ -460,6 +628,10 @@ var fsm = (function () {
 		},
 
 		reset: function () {
+			// Clear auto-save when resetting
+			if (localStorageAvailable()) {
+				localStorage.removeItem(AUTO_SAVE_KEY);
+			}
 			self.setDelegate(delegate);
 			$('#testString').val('');
 			$('#testResult').html('&nbsp;');
